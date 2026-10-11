@@ -1,162 +1,106 @@
 
 import os
-import logging
+import re
+import glob
 import requests
-from io import BytesIO
 from pypdf import PdfReader
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
-HF_MODEL = os.getenv(
-    "HF_MODEL",
-    "Qwen/Qwen2.5-7B-Instruct"
-)
-PDF_FOLDER = "pdfs"
+MODEL = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 
 documents = []
 
-
 def load_pdfs():
-    global documents
-    documents = []
+    documents.clear()
 
-    if not os.path.isdir(PDF_FOLDER):
-        os.makedirs(PDF_FOLDER, exist_ok=True)
+    for filename in sorted(glob.glob("*.pdf")):
+        try:
+            reader = PdfReader(filename)
 
-    for filename in os.listdir(PDF_FOLDER):
-        if filename.lower().endswith(".pdf"):
-            path = os.path.join(PDF_FOLDER, filename)
-            try:
-                reader = PdfReader(path)
-                text = "\n".join(
-                    page.extract_text() or ""
-                    for page in reader.pages
-                )
-                if text.strip():
+            for page_number, page in enumerate(reader.pages, start=1):
+                content = page.extract_text() or ""
+                content = re.sub(r"\s+", " ", content).strip()
+
+                if content:
                     documents.append({
-                        "name": filename,
-                        "text": text
+                        "file": os.path.basename(filename),
+                        "page": page_number,
+                        "text": content
                     })
-                    logging.info("PDF yuklandi: %s", filename)
-            except Exception:
-                logging.exception("PDF o'qilmadi: %s", filename)
+
+            print("PDF o'qildi:", filename)
+
+        except Exception as error:
+            print("PDF xatosi:", filename, error)
+
+    print("Jami sahifalar:", len(documents))
 
 
-def find_context(question, limit=5):
-    words = {
-        word.lower().strip(".,!?():;")
-        for word in question.split()
-        if len(word) > 2
-    }
-    matches = []
+def find_context(question):
+    words = set(re.findall(r"\w+", question.lower()))
+    words = {word for word in words if len(word) > 2}
 
-    for document in documents:
-        paragraphs = document["text"].splitlines()
-        for paragraph in paragraphs:
-            paragraph = paragraph.strip()
-            if len(paragraph) < 30:
-                continue
+    scored = []
 
-            paragraph_words = {
-                word.lower().strip(".,!?():;")
-                for word in paragraph.split()
-            }
-            score = len(words & paragraph_words)
+    for doc in documents:
+        text_words = set(re.findall(r"\w+", doc["text"].lower()))
+        score = len(words & text_words)
 
-            if score:
-                matches.append(
-                    (score, document["name"], paragraph)
-                )
+        if score > 0:
+            scored.append((score, doc))
 
-    matches.sort(key=lambda item: item[0], reverse=True)
-    selected = []
-    seen = set()
+    scored.sort(key=lambda item: item[0], reverse=True)
 
-    for score, name, paragraph in matches:
-        key = (name, paragraph)
-        if key not in seen:
-            selected.append((name, paragraph))
-            seen.add(key)
-        if len(selected) >= limit:
-            break
+    results = []
+    for score, doc in scored[:5]:
+        results.append(
+            f"Manba: {doc['file']}, {doc['page']}-sahifa\n"
+            f"{doc['text'][:2500]}"
+        )
 
-    return selected
+    return "\n\n".join(results)
 
 
 def ask_ai(question, context):
-    if not HF_TOKEN:
-        return "AI tokeni hali sozlanmagan. Administrator HF_TOKEN ni sozlashi kerak."
-
-    context_text = "\n\n".join(
-        f"PDF: {name}\n{paragraph}"
-        for name, paragraph in context
-    )
-
-    if not context_text:
-        return "PDF hujjatlaridan savolga mos ma'lumot topilmadi."
-
-    url = (
-        "https://router.huggingface.co/v1/"
-        "chat/completions"
-    )
+    url = "https://router.huggingface.co/v1/chat/completions"
 
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
 
     payload = {
-        "model": HF_MODEL,
+        "model": MODEL,
         "messages": [
             {
                 "role": "system",
                 "content": (
                     "Sen o'zbek tilida javob beradigan yordamchisan. "
-                    "Asosan berilgan PDF parchalariga tayan. "
-                    "Javob hujjatlarda bo'lmasa, buni ochiq ayt. "
-                    "Ma'lumotni o'ylab topma."
-                ),
+                    "Faqat berilgan PDF matnlariga asoslan. "
+                    "Javobni aniq va tushunarli yoz. "
+                    "Agar matnda javob bo'lmasa, buni ochiq ayt. "
+                    "Manba fayli va sahifasini ko'rsat."
+                )
             },
             {
                 "role": "user",
                 "content": (
-                    f"PDF ma'lumotlari:\n{context_text}\n\n"
+                    f"PDF ma'lumotlari:\n{context}\n\n"
                     f"Savol: {question}"
-                ),
-            },
+                )
+            }
         ],
-        "max_tokens": 500,
         "temperature": 0.2,
+        "max_tokens": 600
     }
 
     response = requests.post(
-        url,
-        headers=headers,
-        json=payload,
-        timeout=90,
+        url, headers=headers, json=payload, timeout=90
     )
-
-    if response.status_code != 200:
-        logging.error(
-            "AI xatosi %s: %s",
-            response.status_code,
-            response.text[:500],
-        )
-        return (
-            "AI xizmatidan javob olib bo'lmadi. "
-            "Model nomi, ruxsat yoki bepul limitni tekshirish kerak."
-        )
+    response.raise_for_status()
 
     data = response.json()
     return data["choices"][0]["message"]["content"].strip()
@@ -164,68 +108,57 @@ def ask_ai(question, context):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Assalomu alaykum!\n"
-        "Men PDF hujjatlar asosida savollarga javob beruvchi botman.\n"
-        "Savolingni yoz."
+        "Salom! Men PDF hujjatlar asosida savollarga javob beraman. "
+        "Savolingni o'zbek tilida yoz."
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Savolingni oddiy matn ko'rinishida yubor.\n"
-        "Javoblar yuklangan PDF hujjatlar asosida tayyorlanadi."
-    )
+async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    question = update.message.text.strip()
 
-
-async def handle_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    question = update.message.text
-
-    if not question:
+    if not documents:
+        await update.message.reply_text(
+            "PDF hujjatlar topilmadi. Administrator sozlamalarni tekshirishi kerak."
+        )
         return
 
-    await update.message.reply_text("Savolingni tekshiryapman...")
+    relevant = find_context(question)
+
+    if not relevant:
+        await update.message.reply_text(
+            "PDF hujjatlardan savolingga mos ma'lumot topilmadi."
+        )
+        return
+
+    await update.message.reply_text("Hujjatlarni tekshiryapman...")
 
     try:
-        relevant_context = find_context(question)
+        result = ask_ai(question, relevant)
+        await update.message.reply_text(result[:4000])
 
-        if not relevant_context:
-            await update.message.reply_text(
-                "PDF fayllardan mos ma'lumot topilmadi. "
-                "Hujjatlar joylanganini tekshir."
-            )
-            return
-
-        answer = ask_ai(question, relevant_context)
-
-        if len(answer) > 4000:
-            answer = answer[:3950] + "\n\n(Javob qisqartirildi.)"
-
-        await update.message.reply_text(answer)
-
-    except Exception:
-        logging.exception("Xabarni qayta ishlashda xato")
+    except Exception as error:
+        print("AI xatosi:", error)
         await update.message.reply_text(
-            "Xatolik yuz berdi. Keyinroq qayta urinib ko'r."
+            "AI xizmatiga ulanishda xatolik yuz berdi. "
+            "Keyinroq qayta urinib ko'r."
         )
 
 
 def main():
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN sozlanmagan.")
+    if not TELEGRAM_TOKEN or not HF_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_TOKEN va HF_TOKEN sozlamalarini kiriting."
+        )
 
     load_pdfs()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, answer)
     )
 
-    logging.info("Bot ishga tushmoqda. PDF soni: %s", len(documents))
+    print("Bot ishga tushmoqda...")
     app.run_polling()
 
 
