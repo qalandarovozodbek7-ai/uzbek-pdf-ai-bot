@@ -3,6 +3,8 @@ import os
 import re
 import glob
 import requests
+import threading
+from flask import Flask
 from pypdf import PdfReader
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -162,5 +164,16 @@ def main():
     app.run_polling()
 
 
-if __name__ == "__main__":
-    main()
+web = Flask(name)
+
+@web.route(”/”)
+def home():
+return “Uzbek PDF AI bot ishlayapti!”, 200
+
+if name == “main”:
+threading.Thread(target=main, daemon=True).start()
+web.run(
+host=“0.0.0.0”,
+port=int(os.environ.get(“PORT”, 10000))
+)
+    
