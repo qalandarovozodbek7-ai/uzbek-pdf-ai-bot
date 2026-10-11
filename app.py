@@ -2,18 +2,40 @@
 import os
 import re
 import glob
-import requests
 import threading
+import requests
+
 from flask import Flask
 from pypdf import PdfReader
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
 MODEL = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 
 documents = []
+web = Flask(__name__)
+
+
+@web.route("/")
+def home():
+    return "Uzbek PDF AI bot ishlayapti!", 200
+
+
+def web_server():
+    web.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000)),
+        use_reloader=False,
+    )
+
 
 def load_pdfs():
     documents.clear()
@@ -30,7 +52,7 @@ def load_pdfs():
                     documents.append({
                         "file": os.path.basename(filename),
                         "page": page_number,
-                        "text": content
+                        "text": content,
                     })
 
             print("PDF o'qildi:", filename)
@@ -57,6 +79,7 @@ def find_context(question):
     scored.sort(key=lambda item: item[0], reverse=True)
 
     results = []
+
     for score, doc in scored[:5]:
         results.append(
             f"Manba: {doc['file']}, {doc['page']}-sahifa\n"
@@ -71,7 +94,7 @@ def ask_ai(question, context):
 
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     payload = {
@@ -83,24 +106,27 @@ def ask_ai(question, context):
                     "Sen o'zbek tilida javob beradigan yordamchisan. "
                     "Faqat berilgan PDF matnlariga asoslan. "
                     "Javobni aniq va tushunarli yoz. "
-                    "Agar matnda javob bo'lmasa, buni ochiq ayt. "
+                    "Agar javob PDF matnida bo'lmasa, buni ochiq ayt. "
                     "Manba fayli va sahifasini ko'rsat."
-                )
+                ),
             },
             {
                 "role": "user",
                 "content": (
                     f"PDF ma'lumotlari:\n{context}\n\n"
                     f"Savol: {question}"
-                )
-            }
+                ),
+            },
         ],
         "temperature": 0.2,
-        "max_tokens": 600
+        "max_tokens": 600,
     }
 
     response = requests.post(
-        url, headers=headers, json=payload, timeout=90
+        url,
+        headers=headers,
+        json=payload,
+        timeout=90,
     )
     response.raise_for_status()
 
@@ -108,19 +134,28 @@ def ask_ai(question, context):
     return data["choices"][0]["message"]["content"].strip()
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     await update.message.reply_text(
-        "Salom! Men PDF hujjatlar asosida savollarga javob beraman. "
-        "Savolingni o'zbek tilida yoz."
+        "Salom! Men 10 ta PDF hujjat asosida "
+        "savollarga javob beraman. Savolingni yoz."
     )
 
 
-async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def answer(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not update.message or not update.message.text:
+        return
+
     question = update.message.text.strip()
 
     if not documents:
         await update.message.reply_text(
-            "PDF hujjatlar topilmadi. Administrator sozlamalarni tekshirishi kerak."
+            "PDF hujjatlar topilmadi. Server sozlamalarini tekshirish kerak."
         )
         return
 
@@ -132,7 +167,9 @@ async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("Hujjatlarni tekshiryapman...")
+    await update.message.reply_text(
+        "Hujjatlarni tekshiryapman..."
+    )
 
     try:
         result = ask_ai(question, relevant)
@@ -141,39 +178,35 @@ async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as error:
         print("AI xatosi:", error)
         await update.message.reply_text(
-            "AI xizmatiga ulanishda xatolik yuz berdi. "
-            "Keyinroq qayta urinib ko'r."
+            "AI xizmatida xatolik yuz berdi. "
+            "Birozdan keyin qayta urinib ko'r."
         )
 
 
 def main():
-    if not TELEGRAM_TOKEN or not HF_TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_TOKEN va HF_TOKEN sozlamalarini kiriting."
-        )
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN sozlanmagan.")
+
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN sozlanmagan.")
 
     load_pdfs()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, answer)
     )
 
-    print("Bot ishga tushmoqda...")
+    print("Telegram bot ishga tushmoqda...")
     app.run_polling()
 
 
-web = Flask(name)
+if __name__ == "__main__":
+    threading.Thread(
+        target=web_server,
+        daemon=True,
+    ).start()
 
-@web.route(”/”)
-def home():
-return “Uzbek PDF AI bot ishlayapti!”, 200
-
-if name == “main”:
-threading.Thread(target=main, daemon=True).start()
-web.run(
-host=“0.0.0.0”,
-port=int(os.environ.get(“PORT”, 10000))
-)
-    
+    main()
