@@ -3,6 +3,7 @@ import os
 import glob
 import logging
 import threading
+import asyncio
 import requests
 import fitz
 
@@ -23,14 +24,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PDF_DIR = os.path.join(BASE_DIR, "pdfs")
 
 documents = []
 pdf_count = 0
 page_count = 0
 pdf_errors = 0
 
-app = Flask(__name__)
+web = Flask(__name__)
 
 
 def load_pdfs():
@@ -41,7 +41,6 @@ def load_pdfs():
     page_count = 0
     pdf_errors = 0
 
-    # PDF fayllarni loyiha ichidagi barcha papkalardan qidirish
     paths = glob.glob(
         os.path.join(BASE_DIR, "**", "*.pdf"),
         recursive=True,
@@ -51,44 +50,28 @@ def load_pdfs():
     logger.info("Topilgan PDF fayllar: %s", len(paths))
 
     for path in paths:
-        pdf_count += 1
-
         try:
-            doc = fitz.open(path)
-            extracted = 0
+            with fitz.open(path) as doc:
+                pdf_count += 1
+                extracted = 0
 
-            for index, page in enumerate(doc):
-                text = page.get_text("text").strip()
+                for index, page in enumerate(doc):
+                    text = page.get_text("text").strip()
 
-                # Birinchi sahifa diagnostikasi
-                if index == 0:
-                    logger.info(
-                        "PDF=%s | Sahifalar=%s | "
-                        "Birinchi sahifa matni=%s belgi | "
-                        "Rasmlar=%s",
-                        os.path.basename(path),
-                        len(doc),
-                        len(text),
-                        len(page.get_images(full=True)),
-                    )
                     if text:
-                        logger.info("Matn namunasi: %r", text[:200])
+                        documents.append({
+                            "file": os.path.basename(path),
+                            "page": index + 1,
+                            "text": text,
+                        })
+                        extracted += 1
+                        page_count += 1
 
-                if text:
-                    documents.append({
-                        "file": os.path.basename(path),
-                        "page": index + 1,
-                        "text": text,
-                    })
-                    extracted += 1
-                    page_count += 1
-
-            logger.info(
-                "%s: %s sahifadan matn olindi",
-                os.path.basename(path),
-                extracted,
-            )
-            doc.close()
+                logger.info(
+                    "%s: %s sahifadan matn olindi",
+                    os.path.basename(path),
+                    extracted,
+                )
 
         except Exception:
             pdf_errors += 1
@@ -96,21 +79,23 @@ def load_pdfs():
 
     logger.info(
         "Yakun: PDF=%s, matnli sahifa=%s, xato=%s",
-        pdf_count, page_count, pdf_errors,
+        pdf_count,
+        page_count,
+        pdf_errors,
     )
 
 
 def find_context(question, max_chars=10000):
     words = {
-        word.lower().strip(".,!?():;\"'")
+        word.lower().strip(".,!?():;\"'«»")
         for word in question.split()
         if len(word) > 2
     }
 
     ranked = []
+
     for item in documents:
-        text = item["text"]
-        lower = text.lower()
+        lower = item["text"].lower()
         score = sum(1 for word in words if word in lower)
 
         if score:
@@ -127,8 +112,10 @@ def find_context(question, max_chars=10000):
             f"sahifa {item['page']}\n"
             f"{item['text']}\n"
         )
+
         if total + len(chunk) > max_chars:
             break
+
         result.append(chunk)
         total += len(chunk)
 
@@ -137,15 +124,20 @@ def find_context(question, max_chars=10000):
 
 def ask_ai(question):
     token = os.getenv("HF_TOKEN")
+
     if not token:
-        return "HF_TOKEN sozlanmagan. Render → Environment bo‘limini tekshir."
+        return (
+            "AI token sozlanmagan. Render → Environment "
+            "bo‘limida HF_TOKEN mavjudligini tekshir."
+        )
 
     context = find_context(question)
 
     if not context:
         return (
-            "PDF fayllardan bu savolga mos matn topilmadi. "
-            "Avval /status buyrug‘i bilan matnli sahifalar sonini tekshir."
+            "PDF hujjatlardan savolingga mos matn topilmadi. "
+            "/status orqali PDF va matnli sahifalar sonini tekshir. "
+            "PDF skanerlangan rasm bo‘lsa, OCR talab qilinishi mumkin."
         )
 
     url = "https://router.huggingface.co/v1/chat/completions"
@@ -161,17 +153,19 @@ def ask_ai(question):
             {
                 "role": "system",
                 "content": (
-                    "Sen o‘zbek tilida javob beradigan yordamchisan. "
-                    "Faqat berilgan PDF matniga asoslan. "
-                    "Javobni o‘zbek tilida aniq yoz. "
-                    "Javob manbada bo‘lmasa, buni ochiq ayt. "
-                    "Manba fayli va sahifasini ko‘rsat."
+                    "Sen yo‘l qurilishi, yo‘l ekspluatatsiyasi, "
+                    "laboratoriya sinovlari va sifat nazorati "
+                    "bo‘yicha o‘zbek tilida javob beradigan yordamchisan. "
+                    "Faqat berilgan hujjat matniga asoslan. "
+                    "Aniq javob manbada bo‘lmasa, buni ochiq ayt. "
+                    "Me’yor, raqam yoki standartni o‘ylab topma. "
+                    "Javob oxirida manba fayli va sahifasini ko‘rsat."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"PDF matnlari:\n{context}\n\n"
+                    f"Hujjatlardan topilgan matn:\n{context}\n\n"
                     f"Savol: {question}"
                 ),
             },
@@ -195,8 +189,8 @@ def ask_ai(question):
                 response.text[:1000],
             )
             return (
-                f"AI xatosi: {response.status_code}. "
-                "Render Logs bo‘limini tekshirish kerak."
+                f"AI xizmati xatosi: HTTP {response.status_code}. "
+                "Render Logs va HF_TOKEN sozlamasini tekshirish kerak."
             )
 
         data = response.json()
@@ -204,15 +198,19 @@ def ask_ai(question):
 
     except Exception:
         logger.exception("AI so‘rovida xato")
-        return "AI xizmatiga ulanishda xato yuz berdi. Keyinroq urinib ko‘r."
+        return (
+            "AI xizmatiga ulanishda xato yuz berdi. "
+            "Keyinroq urinib ko‘r."
+        )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Salom! Men PDF hujjatlar asosida javob beraman.\n"
-        "Savolingni yoz.\n\n"
+        "Salom! Men yo‘l qurilishi va boshqa PDF hujjatlar "
+        "asosida savollarga javob beraman.\n\n"
+        "Savolingni yoz.\n"
         "/status — PDF holati\n"
-        "/reload — PDF fayllarni qayta o‘qish"
+        "/reload — PDFlarni qayta o‘qish"
     )
 
 
@@ -227,8 +225,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reload_pdfs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("PDF fayllar qayta o‘qilmoqda...")
     await asyncio.to_thread(load_pdfs)
+
     await update.message.reply_text(
-        f"Tayyor.\nPDF: {pdf_count}\n"
+        f"Tayyor.\n"
+        f"PDF: {pdf_count}\n"
         f"Matnli sahifalar: {page_count}\n"
         f"Xatolar: {pdf_errors}"
     )
@@ -238,18 +238,23 @@ async def answer_question(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if not update.message or not update.message.text:
+        return
+
     question = update.message.text.strip()
-    await update.message.reply_text("Hujjatlardan javob qidiryapman...")
+
+    await update.message.reply_text(
+        "Hujjatlardan javob qidiryapman..."
+    )
+
     answer = await asyncio.to_thread(ask_ai, question)
+
     await update.message.reply_text(answer[:4000])
-
-
-web = Flask(__name__)
 
 
 @web.route("/")
 def home():
-    return "PDF bot ishlayapti"
+    return "PDF bot ishlayapti", 200
 
 
 @web.route("/health")
@@ -266,17 +271,25 @@ def main():
     load_pdfs()
 
     token = os.getenv("TELEGRAM_TOKEN")
+
     if not token:
-        raise RuntimeError("TELEGRAM_TOKEN sozlanmagan")
+        raise RuntimeError(
+            "TELEGRAM_TOKEN sozlanmagan. "
+            "Render Environment bo‘limini tekshir."
+        )
 
     threading.Thread(target=run_web, daemon=True).start()
 
     bot = Application.builder().token(token).build()
+
     bot.add_handler(CommandHandler("start", start))
     bot.add_handler(CommandHandler("status", status))
     bot.add_handler(CommandHandler("reload", reload_pdfs))
     bot.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, answer_question)
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            answer_question,
+        )
     )
 
     logger.info("Telegram bot ishga tushmoqda")
@@ -284,5 +297,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import asyncio
     main()
