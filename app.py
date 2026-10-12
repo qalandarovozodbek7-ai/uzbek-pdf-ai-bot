@@ -1,12 +1,12 @@
 
 import os
+import glob
 import logging
-import asyncio
-from pathlib import Path
+import threading
 
+import fitz
 import requests
 from flask import Flask
-from pypdf import PdfReader
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -16,176 +16,159 @@ from telegram.ext import (
     filters,
 )
 
+# ---------------- SOZLAMALAR ----------------
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+MODEL = "Qwen/Qwen2.5-7B-Instruct"
+HF_URL = "https://router.huggingface.co/v1/chat/completions"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-BASE_DIR = Path(__file__).resolve().parent
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_TOKEN")
+app = Flask(__name__)
 
-MODEL = "Qwen/Qwen2.5-7B-Instruct"
-AI_URL = "https://router.huggingface.co/v1/chat/completions"
-
-web = Flask(__name__)
 documents = []
 pdf_count = 0
 pages_read = 0
-pdf_errors = 0
+pdf_errors = []
 
 
-@web.get("/")
-def home():
-    return "PDF AI bot ishlayapti!", 200
-
-
-@web.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "pdf_files": pdf_count,
-        "pages_read": pages_read,
-    }, 200
-
+# ---------------- PDF MATNINI O'QISH ----------------
 
 def load_pdfs():
     global documents, pdf_count, pages_read, pdf_errors
 
     new_documents = []
-    found = 0
-    read_pages = 0
-    errors = 0
+    errors = []
+    total_pdfs = 0
+    total_pages = 0
 
-    for file in sorted(BASE_DIR.glob("*.pdf")):
-        found += 1
-        parts = []
+    pdf_files = glob.glob(
+        os.path.join(BASE_DIR, "**", "*.pdf"),
+        recursive=True,
+    )
+
+    pdf_files = sorted(set(pdf_files))
+
+    for pdf_path in pdf_files:
+        total_pdfs += 1
 
         try:
-            reader = PdfReader(str(file))
+            with fitz.open(pdf_path) as pdf:
+                for page_number, page in enumerate(pdf):
+                    try:
+                        text = page.get_text("text").strip()
 
-            for number, page in enumerate(reader.pages, start=1):
-                try:
-                    text = page.extract_text() or ""
+                        if text:
+                            new_documents.append({
+                                "file": os.path.basename(pdf_path),
+                                "page": page_number + 1,
+                                "text": text,
+                            })
+                            total_pages += 1
 
-                    if not text.strip():
-                        text = page.extract_text(
-                            extraction_mode="layout"
-                        ) or ""
-
-                    if text.strip():
-                        parts.append(
-                            f"[{file.name}, {number}-sahifa]\n{text}"
+                    except Exception as exc:
+                        errors.append(
+                            f"{os.path.basename(pdf_path)}, "
+                            f"{page_number + 1}-sahifa: {exc}"
                         )
-                        read_pages += 1
 
-                except Exception:
-                    logger.exception(
-                        "Sahifa o'qilmadi: %s, %s",
-                        file.name,
-                        number,
-                    )
-
-            if parts:
-                new_documents.append({
-                    "name": file.name,
-                    "text": "\n\n".join(parts),
-                })
-
-            logger.info(
-                "%s: %s ta matnli sahifa",
-                file.name,
-                len(parts),
-            )
-
-        except Exception:
-            errors += 1
-            logger.exception("PDF ochilmadi: %s", file.name)
+        except Exception as exc:
+            errors.append(f"{os.path.basename(pdf_path)}: {exc}")
 
     documents = new_documents
-    pdf_count = found
-    pages_read = read_pages
+    pdf_count = total_pdfs
+    pages_read = total_pages
     pdf_errors = errors
 
     logger.info(
-        "YAKUNIY HOLAT: %s PDF, %s matnli sahifa, %s xato",
-        found,
-        read_pages,
-        errors,
+        "%s ta PDF topildi, %s ta matnli sahifa o'qildi, "
+        "%s ta xato",
+        pdf_count,
+        pages_read,
+        len(pdf_errors),
     )
 
-    return found, read_pages, errors
+    return pdf_count, pages_read, pdf_errors
 
 
-def find_context(question, limit=12000):
+# ---------------- KERAKLI MATNNI TOPISH ----------------
+
+def find_context(question, max_chars=12000):
+    if not documents:
+        return ""
+
     words = {
-        word.lower().strip(".,!?():;\"'«»")
+        word.lower().strip(".,!?():;\"'")
         for word in question.split()
         if len(word) > 2
     }
 
-    matches = []
+    ranked = []
 
     for doc in documents:
-        for paragraph in doc["text"].split("\n\n"):
-            paragraph_words = {
-                word.lower().strip(".,!?():;\"'«»")
-                for word in paragraph.split()
-                if len(word) > 2
-            }
+        text = doc["text"]
+        lower_text = text.lower()
 
-            score = len(words & paragraph_words)
-
-            if score:
-                matches.append(
-                    (score, doc["name"], paragraph.strip())
-                )
-
-    matches.sort(key=lambda item: item[0], reverse=True)
-
-    result = []
-    total = 0
-
-    for score, name, paragraph in matches:
-        piece = f"Hujjat: {name}\n{paragraph}"
-
-        if total + len(piece) > limit:
-            continue
-
-        result.append(piece)
-        total += len(piece)
-
-        if total >= limit:
-            break
-
-    if result:
-        return "\n\n".join(result)
-
-    # Kalit so'z topilmasa, hujjatlardan qisqa kontekst olamiz.
-    for doc in documents:
-        piece = f"Hujjat: {doc['name']}\n{doc['text'][:2000]}"
-
-        if total + len(piece) > limit:
-            break
-
-        result.append(piece)
-        total += len(piece)
-
-    return "\n\n".join(result)
-
-
-def ask_ai(question, context):
-    if not HF_TOKEN:
-        return (
-            "AI tokeni sozlanmagan. Render → Environment bo'limiga "
-            "HF_TOKEN o'zgaruvchisini qo'sh."
+        score = sum(
+            1 for word in words if word in lower_text
         )
 
-    if not context.strip():
+        if score > 0:
+            ranked.append((score, doc))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+
+    # Mos sahifalar topilsa, eng moslarini ishlatamiz
+    if ranked:
+        selected = [doc for _, doc in ranked[:8]]
+    else:
+        # Moslik topilmasa, hujjatlarning boshidan kontekst olamiz
+        selected = documents[:5]
+
+    parts = []
+    used_chars = 0
+
+    for doc in selected:
+        part = (
+            f"Fayl: {doc['file']}\n"
+            f"Sahifa: {doc['page']}\n"
+            f"Matn:\n{doc['text']}\n"
+        )
+
+        remaining = max_chars - used_chars
+
+        if remaining <= 0:
+            break
+
+        parts.append(part[:remaining])
+        used_chars += len(part)
+
+    return "\n---\n".join(parts)
+
+
+# ---------------- AI JAVOBI ----------------
+
+def ask_ai(question):
+    if not HF_TOKEN:
         return (
-            "PDF fayllardan matn topilmadi. /status bilan tekshir. "
-            "Agar PDF skanerlangan rasm bo'lsa, OCR kerak bo'lishi mumkin."
+            "HF_TOKEN sozlanmagan. Render → Environment bo'limida "
+            "HF_TOKEN nomli o'zgaruvchi qo'sh."
+        )
+
+    context = find_context(question)
+
+    if not context:
+        return (
+            "PDF fayllardan matn topilmadi. "
+            "Avval /status orqali holatni tekshir."
         )
 
     headers = {
@@ -199,16 +182,19 @@ def ask_ai(question, context):
             {
                 "role": "system",
                 "content": (
-                    "Sen o'zbek tilidagi PDF hujjatlar yordamchisisan. "
-                    "Savolga berilgan hujjatlar asosida javob ber. "
-                    "Javob hujjatda bo'lmasa, buni ochiq ayt. "
-                    "Ma'lumotni o'ylab topma. Sodda va aniq yoz."
+                    "Sen o'zbek tilida javob beradigan yordamchisan. "
+                    "Asosan berilgan PDF matniga tayan. "
+                    "Javobni hujjatda topilmagan bo'lsa, "
+                    "buni ochiq ayt. Dalil yoki ma'lumotni "
+                    "o'zingdan to'qib chiqarmagin. "
+                    "Kerak bo'lsa fayl nomi va sahifani ko'rsat."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"PDF ma'lumotlari:\n{context}\n\n"
+                    f"PDF hujjatlardan olingan ma'lumot:\n"
+                    f"{context}\n\n"
                     f"Foydalanuvchi savoli: {question}"
                 ),
             },
@@ -219,7 +205,7 @@ def ask_ai(question, context):
 
     try:
         response = requests.post(
-            AI_URL,
+            HF_URL,
             headers=headers,
             json=payload,
             timeout=90,
@@ -227,42 +213,53 @@ def ask_ai(question, context):
 
         if response.status_code != 200:
             logger.error(
-                "AI API xatosi: HTTP %s, %s",
+                "Hugging Face xatosi: %s %s",
                 response.status_code,
-                response.text[:500],
+                response.text[:1000],
             )
             return (
-                f"AI xizmatida xato: HTTP {response.status_code}. "
-                "Render Logs bo'limini tekshir."
+                "AI xizmatida xato yuz berdi. "
+                f"HTTP kodi: {response.status_code}. "
+                "Render loglarini tekshirish kerak."
             )
 
         data = response.json()
-        return data["choices"][0]["message"]["content"].strip()
+        answer = data["choices"][0]["message"]["content"].strip()
+
+        return answer or "AI bo'sh javob qaytardi."
 
     except requests.Timeout:
-        return "AI javobi kechikyapti. Birozdan keyin qayta urin."
+        return "AI javob berishga ulgurmayapti. Birozdan keyin qayta urin."
 
-    except Exception:
-        logger.exception("AI javobida xato")
-        return "AI javobini olishda xato yuz berdi."
+    except Exception as exc:
+        logger.exception("AI so'rovida xato")
+        return f"Javob olishda xato yuz berdi: {exc}"
 
+
+# ---------------- TELEGRAM BUYRUQLARI ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Salom! Men PDF hujjatlar asosida javob beruvchi botman.\n\n"
-        "Savolingni yoz.\n"
-        "/status — PDF holati\n"
+        "Assalomu alaykum!\n\n"
+        "Men PDF hujjatlar asosida savollarga javob beruvchi botman.\n\n"
+        "PDFlar bo'yicha savolingni yoz.\n\n"
+        "/status — bot va PDF holati\n"
         "/reload — PDFlarni qayta o'qish"
     )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    error_text = ""
+
+    if pdf_errors:
+        error_text = "\nXatolar:\n" + "\n".join(pdf_errors[:3])
+
     await update.message.reply_text(
         f"Topilgan PDF: {pdf_count}\n"
-        f"Matni o'qilgan sahifalar: {pages_read}\n"
-        f"Matni bor hujjatlar: {len(documents)}\n"
-        f"PDF xatolari: {pdf_errors}\n"
-        f"AI tokeni: {'Sozlangan' if HF_TOKEN else 'Sozlanmagan'}"
+        f"Matnli sahifalar: {pages_read}\n"
+        f"O'qilgan sahifalar ro'yxati: {len(documents)}\n"
+        f"PDF xatolari: {len(pdf_errors)}"
+        f"{error_text}"
     )
 
 
@@ -270,79 +267,96 @@ async def reload_pdfs(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    await update.message.reply_text("PDFlarni qayta o'qiyapman...")
+    await update.message.reply_text("PDFlar qayta o'qilmoqda...")
 
-    found, pages, errors = await asyncio.to_thread(load_pdfs)
+    count, pages, errors = await __import__("asyncio").to_thread(
+        load_pdfs
+    )
 
     await update.message.reply_text(
         f"Qayta o'qish tugadi.\n"
-        f"PDF: {found}\n"
+        f"PDFlar: {count}\n"
         f"Matnli sahifalar: {pages}\n"
-        f"Xatolar: {errors}"
+        f"Xatolar: {len(errors)}"
     )
 
 
-async def answer_question(
+async def handle_question(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    question = (update.message.text or "").strip()
+    question = update.message.text.strip()
 
     if not question:
         return
 
-    await update.message.reply_text("Hujjatlardan izlayapman...")
-
-    context_text = find_context(question)
-    answer = await asyncio.to_thread(
-        ask_ai,
-        question,
-        context_text,
+    await update.message.reply_text(
+        "Savolingni tekshiryapman, biroz kut..."
     )
 
-    # Telegram xabarining maksimal uzunligidan oshmasin.
+    answer = await __import__("asyncio").to_thread(
+        ask_ai,
+        question,
+    )
+
+    # Telegram bitta xabarda 4096 belgigacha qabul qiladi
     for start_index in range(0, len(answer), 4000):
         await update.message.reply_text(
             answer[start_index:start_index + 4000]
         )
 
 
+# ---------------- WEB HEALTH CHECK ----------------
+
+@app.route("/")
+def home():
+    return "PDF AI bot ishlayapti!"
+
+
+@app.route("/health")
+def health():
+    return {
+        "status": "ok",
+        "pdf_count": pdf_count,
+        "pages_read": pages_read,
+        "errors": len(pdf_errors),
+    }
+
+
+def run_web():
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+
+
+# ---------------- BOTNI ISHGA TUSHIRISH ----------------
+
 def main():
-    if not TOKEN:
+    if not TELEGRAM_TOKEN:
         raise RuntimeError(
-            "TELEGRAM_TOKEN topilmadi. Render Environment ni tekshir."
+            "TELEGRAM_TOKEN Render Environment bo'limida yo'q!"
         )
 
     load_pdfs()
 
-    application = (
-        Application.builder()
-        .token(TOKEN)
-        .build()
-    )
+    threading.Thread(
+        target=run_web,
+        daemon=True,
+    ).start()
+
+    application = Application.builder().token(
+        TELEGRAM_TOKEN
+    ).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("reload", reload_pdfs))
     application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            answer_question,
-        )
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_question)
     )
 
+    logger.info("Telegram bot ishga tushmoqda...")
     application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    import threading
-
-    threading.Thread(
-        target=lambda: web.run(
-            host="0.0.0.0",
-            port=int(os.environ.get("PORT", 10000)),
-        ),
-        daemon=True,
-    ).start()
-
     main()
