@@ -26,11 +26,8 @@ logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HF_URL = "https://router.huggingface.co/v1/chat/completions"
 
-# Render Environment orqali almashtirish mumkin
-HF_MODEL = os.getenv(
-    "HF_MODEL",
-    "Qwen/Qwen2.5-7B-Instruct-1M:fastest",
-)
+# AI modeli
+HF_MODEL = "openai/gpt-oss-20b"
 
 documents = []
 pdf_count = 0
@@ -313,8 +310,10 @@ async def answer_question(
 
     answer = await asyncio.to_thread(ask_ai, question)
 
-    for start in range(0, len(answer), 3500):
-        await update.message.reply_text(answer[start:start + 3500])
+    for start_index in range(0, len(answer), 3500):
+        await update.message.reply_text(
+            answer[start_index:start_index + 3500]
+        )
 
 
 @web.route("/")
