@@ -1,4 +1,5 @@
-python-telegram-bot
-pypdf
-requests
-flask
+
+python-telegram-bot>=21,<23
+Flask>=3.0,<4
+pypdf>=5,<7
+requests>=2.31,<3
